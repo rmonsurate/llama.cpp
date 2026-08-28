@@ -355,7 +355,168 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 }
 
 
-// Run the full save/load test suite (tests 1-5) for a single model.
+// Test 6: sequence state save/load via file
+// This exercises llama_state_seq_save_file() / llama_state_seq_load_file() - the pair used by
+// llama-server for its /slots/{id}?action=save|restore endpoints. The other tests only cover the
+// whole-context file API and the in-memory seq API, so a memory module that silently wrote nothing
+// through the file path would go unnoticed.
+// - decode all but the last prompt token into seq 0 and dump the sequence to a file
+// - assert the file holds more than the bare header, i.e. the memory module actually wrote state
+// - load the file into a FRESH context (the server-restart scenario), replay the last token and
+//   compare the continuation against the baseline
+// - load the file again into a context whose seq 0 already holds *different* state, and check that
+//   the stale state does not leak into the continuation (clear-then-restore semantics)
+static bool test_seq_save_load_file(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
+    LOG("\n=== Test 6: sequence state save/load (file) ===\n");
+
+    if (tokens.size() < 2) {
+        LOG_ERR("%s: need at least 2 prompt tokens\n", __func__);
+        return false;
+    }
+
+    const std::string path = params.out_file + ".seq";
+
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_seq_max = 2;
+
+    // decodes tokens[0, n-1) into seq_id of ctx
+    const auto decode_prefix = [&](llama_context * ctx, llama_seq_id seq_id, bool reversed) {
+        const size_t n_prefix = tokens.size() - 1;
+
+        llama_batch_ptr batch(n_prefix, 0, 1);
+        for (size_t i = 0; i < n_prefix; i++) {
+            const llama_token token = reversed ? tokens[n_prefix - 1 - i] : tokens[i];
+            common_batch_add(batch.get(), token, i, { seq_id }, false);
+        }
+
+        if (llama_decode(ctx, batch.get())) {
+            LOG_ERR("%s: failed to decode prompt\n", __func__);
+            return false;
+        }
+
+        return true;
+    };
+
+    // loads the saved sequence, replays the last token and generates - result must match the baseline
+    const auto restore_and_check = [&](llama_context * ctx, const char * what) {
+        llama_tokens tokens_out(tokens.size());
+        size_t n_token_count_out = 0;
+
+        const size_t nread = llama_state_seq_load_file(ctx, path.c_str(), 0, tokens_out.data(), tokens_out.size(), &n_token_count_out);
+        if (nread == 0) {
+            LOG_ERR("%s: failed to load sequence state (%s)\n", __func__, what);
+            return false;
+        }
+
+        if (n_token_count_out != tokens.size()) {
+            LOG_ERR("%s: token count %zu does not match expected %zu (%s)\n", __func__, n_token_count_out, tokens.size(), what);
+            return false;
+        }
+
+        tokens_out.resize(n_token_count_out);
+        if (tokens_out != tokens) {
+            LOG_ERR("%s: restored tokens differ from the saved ones (%s)\n", __func__, what);
+            return false;
+        }
+
+        LOG_TRC("%s: loaded %zu bytes, %zu tokens (%s)\n", __func__, nread, n_token_count_out, what);
+
+        // replay the last token, which was deliberately not part of the saved state
+        int n_past = (int) n_token_count_out - 1;
+        if (!common_replay_last_token(ctx, tokens.back(), n_past)) {
+            return false;
+        }
+        n_past++;
+
+        auto sparams = llama_sampler_chain_default_params();
+        auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
+        llama_sampler_chain_add(smpl.get(), llama_sampler_init_dist(params.sampling.seed));
+
+        auto result = generate_tokens(ctx, smpl.get(), n_past, params.n_predict, 0);
+        if (result.empty()) {
+            return false;
+        }
+
+        if (result != expected_result) {
+            LOG_ERR("\n%s: error: generation differs from expected (%s)\n", __func__, what);
+            return false;
+        }
+
+        return true;
+    };
+
+    // save the sequence state to a file
+    size_t nwrite = 0;
+    {
+        auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+        if (!ctx) {
+            LOG_ERR("%s: failed to create context\n", __func__);
+            return false;
+        }
+
+        if (llama_get_memory(ctx.get()) == nullptr) {
+            // diffusion models (dream, llada, rnd1, ...) have no memory module, so there is no
+            // per-sequence state to save - the seq file API does not apply to them
+            LOG("SKIP (model has no memory module)\n");
+            return true;
+        }
+
+        if (!decode_prefix(ctx.get(), 0, false)) {
+            return false;
+        }
+
+        nwrite = llama_state_seq_save_file(ctx.get(), path.c_str(), 0, tokens.data(), tokens.size());
+    }
+
+    // the header is: magic + version + n_token_count + the tokens themselves.
+    // anything at or below that means the memory module contributed nothing to the file
+    const size_t n_header = 3*sizeof(uint32_t) + sizeof(llama_token)*tokens.size();
+    if (nwrite <= n_header) {
+        LOG_ERR("%s: sequence state file holds no memory state: %zu bytes written, header alone is %zu bytes\n",
+                __func__, nwrite, n_header);
+        return false;
+    }
+
+    LOG_TRC("%s: saved %zu bytes (%zu bytes of memory state)\n", __func__, nwrite, nwrite - n_header);
+
+    // load into a fresh context - this is what llama-server does after a restart
+    {
+        auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+        if (!ctx) {
+            LOG_ERR("%s: failed to create context\n", __func__);
+            return false;
+        }
+
+        if (!restore_and_check(ctx.get(), "fresh context")) {
+            return false;
+        }
+    }
+
+    // load onto a sequence that already holds different state - the restore must replace it entirely
+    {
+        auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+        if (!ctx) {
+            LOG_ERR("%s: failed to create context\n", __func__);
+            return false;
+        }
+
+        if (!decode_prefix(ctx.get(), 0, true)) {
+            return false;
+        }
+
+        if (!restore_and_check(ctx.get(), "context with stale state")) {
+            return false;
+        }
+    }
+
+    std::filesystem::remove(path);
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+
+// Run the full save/load test suite (tests 1-6) for a single model.
 // Returns true if all tests pass, false otherwise.
 static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     struct common_params params = base_params;
@@ -419,6 +580,11 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
 
     // Test 5: seq copy (device)
     if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
+        return false;
+    }
+
+    // Test 6: sequence state save/load (file)
+    if (!test_seq_save_load_file(model, params, tokens, result_baseline)) {
         return false;
     }
 

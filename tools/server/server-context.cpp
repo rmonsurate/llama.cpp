@@ -38,6 +38,213 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// [TAG_SLOT_CKPT_TRAILER]
+//
+// llama_state_seq_save_file() persists only the token list and the memory state of the sequence.
+// That is not enough to resume prompt caching for recurrent/hybrid models: their state is valid
+// only at the latest position and cannot be rolled back a single token, so without a context
+// checkpoint the server is forced to re-process the whole prompt from scratch after a restore
+// (see the "forcing full prompt re-processing" branch in update_slots()).
+//
+// To fix this we append a self-describing trailer with the slot's context checkpoints *after* the
+// payload written by llama_state_seq_save_file(). The on-disk format produced by libllama itself is
+// left untouched, and the trailer is optional: files without one (older files, or files written by
+// other tools) restore exactly as before, just without any checkpoints.
+//
+// layout (little-endian):
+//   u32 magic ('SCKP'), u32 version, u32 n_checkpoints
+//   per checkpoint: i64 n_tokens, i32 id_task, i32 pos_min, i32 pos_max,
+//                   then { u64 size, size bytes } for each of data_tgt, data_dft, data_spec
+static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504B4353; // 'SCKP'
+static constexpr uint32_t SLOT_CKPT_VERSION = 1;
+
+static constexpr size_t SLOT_CKPT_HEADER_SIZE = 3*sizeof(uint32_t);
+
+struct slot_ckpt_writer {
+    std::vector<uint8_t> buf;
+
+    void u32(uint32_t v) {
+        for (int i = 0; i < 4; i++) {
+            buf.push_back((uint8_t) (v >> (8*i)));
+        }
+    }
+
+    void u64(uint64_t v) {
+        for (int i = 0; i < 8; i++) {
+            buf.push_back((uint8_t) (v >> (8*i)));
+        }
+    }
+
+    void i32(int32_t v) { u32((uint32_t) v); }
+    void i64(int64_t v) { u64((uint64_t) v); }
+
+    void blob(const std::vector<uint8_t> & data) {
+        u64((uint64_t) data.size());
+        buf.insert(buf.end(), data.begin(), data.end());
+    }
+};
+
+struct slot_ckpt_reader {
+    const uint8_t * data = nullptr;
+
+    size_t size = 0;
+    size_t pos  = 0;
+
+    bool ok = true;
+
+    bool need(uint64_t n) {
+        if (!ok || n > (uint64_t) (size - pos)) {
+            ok = false;
+            return false;
+        }
+        return true;
+    }
+
+    uint32_t u32() {
+        if (!need(4)) {
+            return 0;
+        }
+        uint32_t v = 0;
+        for (int i = 0; i < 4; i++) {
+            v |= (uint32_t) data[pos + i] << (8*i);
+        }
+        pos += 4;
+        return v;
+    }
+
+    uint64_t u64() {
+        if (!need(8)) {
+            return 0;
+        }
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++) {
+            v |= (uint64_t) data[pos + i] << (8*i);
+        }
+        pos += 8;
+        return v;
+    }
+
+    int32_t i32() { return (int32_t) u32(); }
+    int64_t i64() { return (int64_t) u64(); }
+
+    bool blob(std::vector<uint8_t> & out) {
+        const uint64_t n = u64();
+        if (!need(n)) {
+            return false;
+        }
+        out.assign(data + pos, data + pos + (size_t) n);
+        pos += (size_t) n;
+        return true;
+    }
+};
+
+// append the checkpoint trailer to an existing slot save file
+// returns the number of bytes appended, or 0 on failure
+static size_t slot_ckpt_append_file(const std::string & filepath, const std::list<common_prompt_checkpoint> & ckpts) {
+    slot_ckpt_writer w;
+
+    w.u32(SLOT_CKPT_MAGIC);
+    w.u32(SLOT_CKPT_VERSION);
+    w.u32((uint32_t) ckpts.size());
+
+    for (const auto & ckpt : ckpts) {
+        w.i64(ckpt.n_tokens);
+        w.i32(ckpt.id_task);
+        w.i32(ckpt.pos_min);
+        w.i32(ckpt.pos_max);
+
+        w.blob(ckpt.data_tgt);
+        w.blob(ckpt.data_dft);
+        w.blob(ckpt.data_spec);
+    }
+
+    std::ofstream file(filepath, std::ios::binary | std::ios::app);
+    if (!file) {
+        return 0;
+    }
+
+    file.write((const char *) w.buf.data(), (std::streamsize) w.buf.size());
+    file.close();
+
+    return file ? w.buf.size() : 0;
+}
+
+// parse the checkpoint trailer located at byte offset `offset` of a slot save file
+// returns the number of trailer bytes consumed, or 0 (leaving `out` untouched) when there is no
+// trailer, or when the trailer is truncated / corrupt / of an unknown version - restoring without
+// checkpoints is always valid
+static size_t slot_ckpt_read_file(const std::string & filepath, size_t offset, std::list<common_prompt_checkpoint> & out) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file) {
+        return 0;
+    }
+
+    file.seekg(0, std::ios::end);
+
+    const std::streamoff fsize = file.tellg();
+    if (fsize < 0 || (size_t) fsize < offset + SLOT_CKPT_HEADER_SIZE) {
+        return 0;
+    }
+
+    const size_t n_trailer = (size_t) fsize - offset;
+
+    std::vector<uint8_t> buf;
+    try {
+        buf.resize(n_trailer);
+    } catch (const std::exception &) {
+        return 0;
+    }
+
+    file.seekg((std::streamoff) offset, std::ios::beg);
+    file.read((char *) buf.data(), (std::streamsize) n_trailer);
+    if ((size_t) file.gcount() != n_trailer) {
+        return 0;
+    }
+
+    slot_ckpt_reader r;
+    r.data = buf.data();
+    r.size = buf.size();
+
+    if (r.u32() != SLOT_CKPT_MAGIC) {
+        return 0;
+    }
+
+    const uint32_t version = r.u32();
+    if (version != SLOT_CKPT_VERSION) {
+        SRV_WRN("unknown context checkpoint trailer version %u in '%s' - ignoring\n", version, filepath.c_str());
+        return 0;
+    }
+
+    const uint32_t n_ckpt = r.u32();
+
+    std::list<common_prompt_checkpoint> res;
+
+    for (uint32_t i = 0; i < n_ckpt && r.ok; i++) {
+        common_prompt_checkpoint ckpt;
+
+        ckpt.n_tokens = r.i64();
+        ckpt.id_task  = r.i32();
+        ckpt.pos_min  = r.i32();
+        ckpt.pos_max  = r.i32();
+
+        if (!r.ok || !r.blob(ckpt.data_tgt) || !r.blob(ckpt.data_dft) || !r.blob(ckpt.data_spec)) {
+            r.ok = false;
+            break;
+        }
+
+        res.push_back(std::move(ckpt));
+    }
+
+    if (!r.ok) {
+        SRV_WRN("corrupt or truncated context checkpoint trailer in '%s' - ignoring\n", filepath.c_str());
+        return 0;
+    }
+
+    out = std::move(res);
+
+    return r.pos;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -2535,6 +2742,10 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    if (slot->prompt.tokens.size() == 0) {
+                        SRV_WRN("slot %d is empty - the saved file will not contain any reusable prompt state (n_saved = 0)\n", id_slot);
+                    }
+
                     std::vector<char> packed;
                     try {
                         packed = slot->prompt.tokens.serialize();
@@ -2544,12 +2755,26 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
+                    size_t nwrite = llama_state_seq_save_file(
                         ctx_tgt, filepath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                     if (nwrite == 0) {
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
+                    }
+
+                    // [TAG_SLOT_CKPT_TRAILER] persist the context checkpoints - without them, prompt cache
+                    // reuse after a restore is impossible for recurrent/hybrid memory
+                    if (!slot->prompt.checkpoints.empty()) {
+                        const size_t nwrite_ckpt = slot_ckpt_append_file(filepath, slot->prompt.checkpoints);
+                        if (nwrite_ckpt == 0) {
+                            SRV_WRN("failed to save the context checkpoints of slot %d to '%s' - prompt cache reuse will be lost after a restore\n",
+                                    id_slot, filepath.c_str());
+                        } else {
+                            SRV_INF("saved %d context checkpoint(s) of slot %d (%.3f MiB)\n",
+                                    (int) slot->prompt.checkpoints.size(), id_slot, (float) nwrite_ckpt / 1024 / 1024);
+                            nwrite += nwrite_ckpt;
+                        }
                     }
 
                     const int64_t t_end = ggml_time_us();
@@ -2611,6 +2836,40 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // [TAG_SLOT_CKPT_TRAILER] restore the context checkpoints, if the file has any.
+                        // must happen after prompt.clear() above, which wipes them.
+                        // a missing / unknown / corrupt trailer is not an error - we simply restore without
+                        // checkpoints, which is what the pre-trailer behavior was
+                        try {
+                            std::list<common_prompt_checkpoint> checkpoints;
+
+                            const size_t nread_ckpt = slot_ckpt_read_file(filepath, nread, checkpoints);
+                            if (nread_ckpt > 0) {
+                                nread += nread_ckpt;
+
+                                if (ctx_dft == nullptr) {
+                                    // this server has no draft context - the saved draft state is unusable here
+                                    for (auto & ckpt : checkpoints) {
+                                        ckpt.clear_dft();
+                                        ckpt.data_spec.clear();
+                                    }
+                                }
+
+                                size_t size_ckpt = 0;
+                                for (const auto & ckpt : checkpoints) {
+                                    size_ckpt += ckpt.size();
+                                }
+
+                                slot->prompt.checkpoints = std::move(checkpoints);
+
+                                SRV_INF("restored %d context checkpoint(s) of slot %d (%.3f MiB)\n",
+                                        (int) slot->prompt.checkpoints.size(), id_slot, (float) size_ckpt / 1024 / 1024);
+                            }
+                        } catch (const std::exception & err) {
+                            SRV_WRN("failed to restore the context checkpoints of slot %d: %s (continuing without them)\n", id_slot, err.what());
+                            slot->prompt.checkpoints.clear();
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);

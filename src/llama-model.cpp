@@ -1716,7 +1716,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors();
+    // qwen4exp builds only the trunk layers, so the tensors of its MTP block stay unclaimed
+    ml.done_getting_tensors(arch == LLM_ARCH_QWEN4EXP && hparams.n_layer_nextn > 0);
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.

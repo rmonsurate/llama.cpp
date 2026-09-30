@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - master
+      - victoria-mtp-ci
     paths: [
       '.github/workflows/release.yml',
       '**/CMakeLists.txt',
@@ -49,7 +50,7 @@ jobs:
         env:
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ github.ref }}" == "refs/heads/victoria-mtp-ci" ]]; then
             echo "should_release=true" >> $GITHUB_OUTPUT
           elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/master" ]]; then
             if echo "$COMMIT_MESSAGE" | grep -q '\[no release\]'; then
@@ -152,8 +153,6 @@ jobs:
             os: ubuntu-22.04
           - build: 'arm64'
             os: ubuntu-24.04-arm
-          - build: 's390x'
-            os: ubuntu-24.04-s390x
 
     runs-on: ${{ matrix.os }}
 
@@ -230,7 +229,7 @@ jobs:
 
   ubuntu-vulkan:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     strategy:
       matrix:
@@ -454,7 +453,7 @@ jobs:
 
   android-arm64:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     runs-on: ubuntu-24.04  # previously ubuntu-latest
 
@@ -546,7 +545,7 @@ jobs:
 
   android-arm64-snapdragon:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     runs-on: ubuntu-latest
     container: 'ghcr.io/snapdragon-toolchain/arm64-android:v0.7'
@@ -603,7 +602,7 @@ jobs:
 
   linux-arm64-snapdragon:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     runs-on: ubuntu-latest
     container: 'ghcr.io/snapdragon-toolchain/arm64-linux:v0.7'
@@ -660,7 +659,7 @@ jobs:
 
   ubuntu-24-openvino:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     runs-on: ubuntu-24.04
 
@@ -778,7 +777,7 @@ jobs:
 
   windows-openvino:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     runs-on: windows-2022
 
@@ -977,7 +976,7 @@ jobs:
   #       windows-cpu zip during the release "Merge artifacts" step
   windows-rocm:
     needs: [check-release]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     runs-on: windows-2022
 
@@ -1138,7 +1137,7 @@ jobs:
   #       is injected from the windows-cpu zip during the release "Merge artifacts" step
   windows:
     needs: [check-release]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     runs-on: windows-2025
 
@@ -1335,7 +1334,7 @@ jobs:
   #       windows-cpu zip during the release "Merge artifacts" step
   windows-sycl:
     needs: [check-release]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     runs-on: windows-2022
 
@@ -1439,7 +1438,7 @@ jobs:
 
   ubuntu-24-sycl:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     strategy:
       matrix:
@@ -1532,7 +1531,7 @@ jobs:
 
   ubuntu-24-rocm:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     runs-on: ubuntu-24.04
 
@@ -1659,7 +1658,7 @@ jobs:
 
   ios-xcode:
     needs: [check-release]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
     runs-on: macos-26
 
     steps:
@@ -1814,7 +1813,7 @@ jobs:
     uses: ./.github/workflows/ui-build.yml
 
   release:
-    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     # Fine-grant permission
     # https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
@@ -2027,7 +2026,7 @@ jobs:
             }
 
   ui-publish:
-    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+    if: false  # victoria-mtp: only the five release targets
 
     needs:
       - release

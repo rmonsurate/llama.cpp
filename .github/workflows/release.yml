@@ -85,7 +85,7 @@ jobs:
         uses: ./.github/actions/get-tag-name
 
       - name: Create and push git tag
-        if: ${{ steps.check.outputs.should_release == 'true' }}
+        if: false  # victoria-mtp: the tag is created with the release, by hand
         run: |
           TAG="${{ steps.tag.outputs.name }}"
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then

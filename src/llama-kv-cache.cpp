@@ -372,8 +372,8 @@ llama_kv_cache::llama_kv_cache(
         }
 
         // ARC-LAB: keep them on the cache's device too (one buffer type only, and not host memory)
-        if ((llama_sync_trim() & 2) && ctxs_bufs.size() == 1 && !hparams.no_alloc) {
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctxs_bufs[0].second.get());
+        if ((llama_sync_trim() & 2) && ctxs_bufs.bufs.size() == 1 && !ctxs_bufs.no_alloc) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctxs_bufs.bufs[0].second.get());
             if (!ggml_backend_buft_is_host(buft)) {
                 ggml_init_params params = {
                     /* .mem_size   = */ attn_rot_hadamard.size()*ggml_tensor_overhead(),
@@ -1298,9 +1298,9 @@ uint32_t llama_kv_cache::get_n_kv_prefix(const slot_info & sinfo, uint32_t n_row
     }
 
     // same padding as get_n_kv
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    const uint32_t n_pad = 256;
 
-    return std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(p1, n_pad_cur)));
+    return std::min(cells.size(), std::max(n_pad, GGML_PAD(p1, n_pad)));
 }
 
 uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
